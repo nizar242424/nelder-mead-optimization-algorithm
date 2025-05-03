@@ -1,189 +1,257 @@
-//#include "Eigen/Dense"
 #include <vector>
 #include <limits>
-#include <cstring>
 #include <iostream>
-using namespace Eigen;
-namespace Optimization
-{
-    template<int nDims>
-    class NelderMead {
-    public:
-        typedef Array<double, 1, nDims> FunctionParameters;
-        typedef std::function<double(FunctionParameters)> ErrorFunction;
-        NelderMead(ErrorFunction errorFunction, FunctionParameters initial,
-                   double minError, double initialEdgeLength,
-                   double shrinkCoeff = 1, double contractionCoeff = 0.5,
-                   double reflectionCoeff = 1, double expansionCoeff = 1)
-                : errorFunction(errorFunction), minError(minError),
-                shrinkCoeff(shrinkCoeff), contractionCoeff(contractionCoeff),
-                reflectionCoeff(reflectionCoeff), expansionCoeff(expansionCoeff),
-                worstValueId(-1), secondWorstValueId(-1), bestValueId(-1)
-        {
-            this->errors = std::vector(nDims + 1, std::numeric_limits<double>::max());
-            const double b = initialEdgeLength / (nDims * SQRT2) * (sqrt(nDims + 1) - 1);
-            const double a = initialEdgeLength / SQRT2;
-            this->values = initial.replicate(nDims + 1, 1);
-            for (int i = 0; i < nDims; i++)
-            {
-                FunctionParameters simplexRow;
-                simplexRow.setConstant(b);
-                simplexRow(0, i) = a;
-                simplexRow += initial;
-                this->values.row(i+1) = simplexRow;
-            }
-        }
-        void optimize()
-        {
-            for (int i = 0; i < nDims+1; i++)
-            {
-                this->errors.at(i) = this->errorFunction(this->values.row(i));
-            }
+#include <functional>
+#include <cmath>
+#include <numeric>
 
-            this->invalidateIdsCache();
-            while (this->errors.at(this->bestValueId) > this->minError)
-            {
-                step();
-                auto bestError = this->errorFunction(this->best());
-                auto worstError = this->errorFunction(this->worst());
-                std::cout << "Best error " << std::to_string(bestError) << " with : " << this->best();
-                std::cout << " Worst error " << std::to_string(worstError) << " with : " << this->worst();
-                std::cout << '\n';
-            }
-        }
-        void step()
-        {
-            auto meanWithoutWorst = this->getMeanWithoutWorst();
-            auto reflectionOfWorst = this->getReflectionOfWorst(meanWithoutWorst);
-            auto reflectionError = this->errorFunction(reflectionOfWorst);
-            FunctionParameters newValue = reflectionOfWorst;
-            double newError = reflectionError;
-            bool shrink = false;
-            if (reflectionError < this->errors.at(this->bestValueId))
-            {
-                auto expansionValue = this->expansion(meanWithoutWorst, reflectionOfWorst);
-                double expansionError = this->errorFunction(expansionValue);
-                if (expansionError < this->errors.at(this->bestValueId))
-                {
-                    newValue = expansionValue;
-                    newError = expansionError;
+using namespace std;
+
+template<int nDims>
+class NelderMead {
+public:
+    typedef vector<double> FunctionParameters;
+    typedef function<double(const FunctionParameters&)> ErrorFunction;
+
+    NelderMead(ErrorFunction errorFunction, 
+               const FunctionParameters& initial,
+               double minError, 
+               double initialEdgeLength,
+               double shrinkCoeff = 0.5,
+               double contractionCoeff = 0.5,
+               double reflectionCoeff = 1.0,
+               double expansionCoeff = 2.0) :
+        errorFunction(errorFunction),
+        minError(minError),
+        shrinkCoeff(shrinkCoeff),
+        contractionCoeff(contractionCoeff),
+        reflectionCoeff(reflectionCoeff),
+        expansionCoeff(expansionCoeff)
+    {
+        this->errors = vector<double>(nDims + 1, numeric_limits<double>::max());
+        this->values = vector<FunctionParameters>(nDims + 1, FunctionParameters(nDims));
+        
+        const double b = initialEdgeLength / (nDims * sqrt(2)) * (sqrt(nDims + 1) - 1);
+        const double a = initialEdgeLength / sqrt(2);
+        
+        for (int i = 0; i < nDims + 1; i++) {
+            if (i == 0) {
+                this->values[i] = initial;
+            } else {
+                FunctionParameters simplexRow(nDims, b);
+                simplexRow[i-1] = a;
+                for (int j = 0; j < nDims; j++) {
+                    this->values[i][j] = simplexRow[j] + initial[j];
                 }
             }
-            else if (reflectionError > this->errors.at(this->worstValueId))
-            {
-                newValue = this->insideContraction(meanWithoutWorst);
-                newError = this->errorFunction(newValue);
+        }
+        
+        for (int i = 0; i < nDims + 1; i++) {
+            this->errors[i] = this->errorFunction(this->values[i]);
+        }
+        
+        invalidateIdsCache();
+    }
 
-                if (newError > this->errors.at(this->worstValueId)) { shrink = true; }
+    void optimize(int maxIterations = 1000) {
+        int iteration = 0;
+        while (this->errors[this->bestValueId] > this->minError && iteration < maxIterations) {
+            step();
+            iteration++;
+            
+            if (iteration % 10 == 0) {
+                cout << "Iteration " << iteration 
+                     << ": Best error = " << this->errors[this->bestValueId]
+                     << " at [";
+                for (double val : this->best()) {
+                    cout << val << " ";
+                }
+                cout << "]" << endl;
             }
-            else if (reflectionError > this->errors.at(this->secondWorstValueId))
-            {
-                newValue = this->outsideContraction(meanWithoutWorst);
-                newError = this->errorFunction(newValue);
-                if (newError > reflectionError) { shrink = true; }
-            }
-            else
-            {
-                newValue = reflectionOfWorst;
+        }
+    }
+
+    const FunctionParameters& best() const { return this->values[this->bestValueId]; }
+    const FunctionParameters& worst() const { return this->values[this->worstValueId]; }
+    double bestError() const { return this->errors[bestValueId]; }
+
+private:
+    void step() {
+        FunctionParameters meanWithoutWorst = getMeanWithoutWorst();
+        FunctionParameters reflection = getReflectionOfWorst(meanWithoutWorst);
+        double reflectionError = errorFunction(reflection);
+        
+        FunctionParameters newValue;
+        double newError;
+        bool shrink = false;
+
+        if (reflectionError < this->errors[bestValueId]) {
+            FunctionParameters expansionValue = expansion(meanWithoutWorst, reflection);
+            double expansionError = errorFunction(expansionValue);
+            
+            if (expansionError < reflectionError) {
+                newValue = expansionValue;
+                newError = expansionError;
+            } else {
+                newValue = reflection;
                 newError = reflectionError;
             }
-            if (shrink)
-            {
-                this->shrink();
-                this->invalidateIdsCache();
-                return;
-            }
-            this->values.row(this->worstValueId) = newValue;
-            this->errors.at(this->worstValueId) = newError;
-            this->invalidateIdsCache();
         }
-        inline FunctionParameters worst() { return this->values.row(this->worstValueId); }
-        inline FunctionParameters best() { return this->values.row(this->bestValueId); }
-    private:
-        void shrink()
-        {
-            auto bestVertex = this->values.row(this->bestValueId);
-            for (int i = 0; i < nDims + 1; i++)
-            {
-                if (i == this->bestValueId) { continue; }
-                this->values.row(i) = bestVertex + this->shrinkCoeff * (this->values.row(i) - bestVertex);
-                this->errors.at(i) = this->errorFunction(this->values.row(i));
-            }
-        }
-        inline FunctionParameters expansion(FunctionParameters meanWithoutWorst, FunctionParameters reflection)
-        {
-            return reflection + this->expansionCoeff * (reflection - meanWithoutWorst);
-        }
-        inline FunctionParameters insideContraction(FunctionParameters meanWithoutWorst)
-        {
-            return meanWithoutWorst - this->contractionCoeff * (meanWithoutWorst - this->worst());
-        }
-        inline FunctionParameters outsideContraction(FunctionParameters meanWithoutWorst)
-        {
-            return meanWithoutWorst + this->contractionCoeff * (meanWithoutWorst - this->worst());
-        }
-        FunctionParameters getReflectionOfWorst(FunctionParameters meanWithoutWorst)
-        {
-            return meanWithoutWorst + this->reflectionCoeff * (meanWithoutWorst - this->worst());
-        }
-        FunctionParameters getMeanWithoutWorst()
-        {
-            FunctionParameters mean(0);
-            for (int i = 0; i < nDims + 1; i++)
-            {
-                if (i == this->worstValueId) { continue; }
-                mean += this->values.row(i);
-            }
-            mean /= nDims;
-            return mean;
-        }
-        void invalidateIdsCache() {
-            double worstError = std::numeric_limits<double>::min();
-            int worstId = -1;
-            double secondWorstError = std::numeric_limits<double>::max();
-            int secondWorstId = -1;
-            double bestError = std::numeric_limits<double>::max();
-            int bestId = -1;
-            for (int i = 0; i < nDims + 1; i++)
-            {
-                auto error = this->errors.at(i);
-                if (error > worstError)
-                {
-                    secondWorstError = worstError;
-                    secondWorstId = worstId;
-                    worstError = error;
-                    worstId = i;
+        else if (reflectionError > this->errors[secondWorstValueId]) {
+            if (reflectionError <= this->errors[worstValueId]) {
+                newValue = outsideContraction(meanWithoutWorst);
+                newError = errorFunction(newValue);
+                
+                if (newError > reflectionError) {
+                    shrink = true;
                 }
-                else if (error > secondWorstError)
-                {
-                    secondWorstError = error;
-                    secondWorstId = i;
-                }
-                if (error < bestError)
-                {
-                    bestError = error;
-                    bestId = i;
+            } else {
+                newValue = insideContraction(meanWithoutWorst);
+                newError = errorFunction(newValue);
+                
+                if (newError > this->errors[worstValueId]) {
+                    shrink = true;
                 }
             }
-                       if (secondWorstId == -1)
-            {
-                secondWorstId = worstId;
-            }
-            this->bestValueId = bestId;
-            this->worstValueId = worstId;
-            this->secondWorstValueId = secondWorstId;
         }
-        ErrorFunction errorFunction;
-        Array<double, nDims + 1, nDims> values;
-        std::vector<double> errors;
-        int worstValueId;
-        int secondWorstValueId;
-        int bestValueId;
-        double minError;
-        double shrinkCoeff;
-        double expansionCoeff;
-        double contractionCoeff;
-        double reflectionCoeff;
-        const double SQRT2 = sqrt(2);
+        else {
+            newValue = reflection;
+            newError = reflectionError;
+        }
+
+        if (shrink) {
+            this->shrink();
+        } else {
+            this->values[worstValueId] = newValue;
+            this->errors[worstValueId] = newError;
+        }
+        
+        invalidateIdsCache();
+    }
+
+    void shrink() {
+        const FunctionParameters& bestVertex = this->values[bestValueId];
+        for (int i = 0; i < nDims + 1; i++) {
+            if (i == bestValueId) continue;
+            
+            for (int j = 0; j < nDims; j++) {
+                this->values[i][j] = bestVertex[j] + 
+                    shrinkCoeff * (this->values[i][j] - bestVertex[j]);
+            }
+            this->errors[i] = errorFunction(this->values[i]);
+        }
+    }
+
+    FunctionParameters expansion(const FunctionParameters& mean, 
+                               const FunctionParameters& reflection) const {
+        FunctionParameters result(nDims);
+        for (int i = 0; i < nDims; i++) {
+            result[i] = mean[i] + expansionCoeff * (reflection[i] - mean[i]);
+        }
+        return result;
+    }
+
+    FunctionParameters insideContraction(const FunctionParameters& mean) const {
+        FunctionParameters result(nDims);
+        const FunctionParameters& w = worst();
+        for (int i = 0; i < nDims; i++) {
+            result[i] = mean[i] - contractionCoeff * (mean[i] - w[i]);
+        }
+        return result;
+    }
+
+    FunctionParameters outsideContraction(const FunctionParameters& mean) const {
+        FunctionParameters result(nDims);
+        const FunctionParameters& w = worst();
+        for (int i = 0; i < nDims; i++) {
+            result[i] = mean[i] + contractionCoeff * (mean[i] - w[i]);
+        }
+        return result;
+    }
+
+    FunctionParameters getReflectionOfWorst(const FunctionParameters& mean) const {
+        FunctionParameters result(nDims);
+        const FunctionParameters& w = worst();
+        for (int i = 0; i < nDims; i++) {
+            result[i] = mean[i] + reflectionCoeff * (mean[i] - w[i]);
+        }
+        return result;
+    }
+
+    FunctionParameters getMeanWithoutWorst() const {
+        FunctionParameters mean(nDims, 0.0);
+        for (int i = 0; i < nDims + 1; i++) {
+            if (i == worstValueId) continue;
+            for (int j = 0; j < nDims; j++) {
+                mean[j] += this->values[i][j];
+            }
+        }
+        for (int j = 0; j < nDims; j++) {
+            mean[j] /= nDims;
+        }
+        return mean;
+    }
+
+    void invalidateIdsCache() {
+        worstValueId = 0;
+        bestValueId = 0;
+        secondWorstValueId = 0;
+
+        for (int i = 1; i < nDims + 1; i++) {
+            if (errors[i] > errors[worstValueId]) {
+                secondWorstValueId = worstValueId;
+                worstValueId = i;
+            } else if (errors[i] > errors[secondWorstValueId]) {
+                secondWorstValueId = i;
+            }
+
+            if (errors[i] < errors[bestValueId]) {
+                bestValueId = i;
+            }
+        }
+
+        if (secondWorstValueId == worstValueId) {
+            for (int i = 0; i < nDims + 1; i++) {
+                if (i != worstValueId && i != bestValueId) {
+                    secondWorstValueId = i;
+                    break;
+                }
+            }
+        }
+    }
+
+    ErrorFunction errorFunction;
+    double minError;
+    double shrinkCoeff;
+    double contractionCoeff;
+    double reflectionCoeff;
+    double expansionCoeff;
+
+    vector<FunctionParameters> values;
+    vector<double> errors;
+    int worstValueId;
+    int secondWorstValueId;
+    int bestValueId;
+};
+
+int main() {
+    auto quadratic = [](const vector<double>& x) {
+        return x[0]*x[0] + x[1]*x[1] + 2*x[0] + 4*x[1] + 5;
     };
+
+    vector<double> initial = {1.0, 1.0};
+
+    NelderMead<2> optimizer(quadratic, initial, 1e-6, 1.0);
+
+    optimizer.optimize();
+
+    cout << "\nOptimization complete!" << endl;
+    cout << "Minimum found at: [";
+    for (double val : optimizer.best()) {
+        cout << val << " ";
+    }
+    cout << "]" << endl;
+    cout << "Function value: " << optimizer.bestError() << endl;
+
+    return 0;
 }
